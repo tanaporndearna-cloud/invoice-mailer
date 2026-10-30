@@ -43,6 +43,11 @@ with st.sidebar:
         st.write(f"รวม zip ทั้งหมด: {total:,.1f} MB")
     else:
         st.caption("ยังไม่ได้อัปโหลด zip")
+    st.divider()
+    st.write("**โควต้าการส่งเมลวันนี้**")
+    quota_box = st.container()
+    if not (data_file and zip_files):
+        quota_box.caption(f"อัปโหลดไฟล์ข้อ 1 และ 2 ก่อน จะแสดงโควต้า (เต็ม {DAILY_LIMIT} เมล/วัน)")
 
 if data_file and zip_files:
     df = load_sheet(data_file)
@@ -104,12 +109,12 @@ if data_file and zip_files:
     used_today = count_sent_today(prev_dfs)
     remaining = max(DAILY_LIMIT - used_today, 0)
     st.write(f"พร้อมส่ง {len(ready)} ใบ = **{len(mails)} เมล** / {ready['ส่งไปที่'].nunique()} อีเมล")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("ส่งแล้ววันนี้", used_today)
-    c2.metric("โควต้าเหลือ", f"{remaining} / {DAILY_LIMIT}")
-    c3.metric("หลังส่งรอบนี้เหลือ", max(remaining - len(mails), 0))
-    st.caption("นับจากไฟล์ผลการส่งที่อัปโหลดในช่องที่ 3 เท่านั้น (เฉพาะไฟล์ที่ดาวน์โหลดจากแอปเวอร์ชันนี้) "
-               "ไม่รวมเมลที่ส่งจากทางอื่นด้วยบัญชีเดียวกัน")
+    with quota_box:
+        st.progress(min(used_today / DAILY_LIMIT, 1.0))
+        st.write(f"ส่งแล้ววันนี้: **{used_today}** / {DAILY_LIMIT}")
+        st.write(f"โควต้าเหลือ: **{remaining}**")
+        st.write(f"หลังส่งรอบนี้เหลือ: **{max(remaining - len(mails), 0)}**")
+        st.caption("นับจากไฟล์ผลการส่งที่อัปโหลดในช่องที่ 3 เท่านั้น ไม่รวมเมลที่ส่งจากทางอื่นด้วยบัญชีเดียวกัน")
     if len(mails) > remaining:
         st.warning(f"เมลที่ต้องส่ง ({len(mails)}) เกินโควต้าที่เหลือ ({remaining}) "
                    f"ระบบจะส่งแค่ {remaining} เมลแรก ที่เหลือส่งพรุ่งนี้")
