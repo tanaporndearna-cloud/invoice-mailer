@@ -175,15 +175,21 @@ def build_bodies(sender_email, branch=None, items=None):
     return text, html
 
 
+def norm_subject(s):
+    s = re.sub(r"^\s*((re|fw|fwd)\s*:\s*)+", "", str(s or ""), flags=re.I)
+    return re.sub(r"\s+", " ", s).strip()
+
+
 def build_message(sender_email, sender_name, to, customer, invoices, pdfs,
-                  branch=None, cust_by_inv=None, reply_to_id=None):
+                  branch=None, cust_by_inv=None, reply_to_id=None, prev_subject=None):
     m = EmailMessage()
     m["From"] = formataddr((sender_name, sender_email)) if sender_name else sender_email
     m["To"] = to
     subject = build_subject(customer, branch, to)
     m["Message-ID"] = make_msgid(domain=sender_email.split("@")[-1])
     if reply_to_id:                      # ตอบกลับเมลเดิมของผู้รับคนนี้
-        subject = "Re: " + subject
+        # ใช้หัวเรื่องเดิม (ไม่สนชื่อร้านใหม่) เพื่อให้ Gmail ต่อเข้ากระทู้เดิม
+        subject = "Re: " + (norm_subject(prev_subject) if prev_subject else subject)
         m["In-Reply-To"] = reply_to_id
         m["References"] = reply_to_id
     m["Subject"] = subject
@@ -213,6 +219,7 @@ def last_message_ids(prev_dfs):
 
 # ---------- ค้นเมลเดิมจากโฟลเดอร์ "ส่งแล้ว" ของ Gmail (IMAP) ----------
 import imaplib, email as _email
+from email.header import decode_header, make_header
 
 
 def _sent_folder(imap):
@@ -235,16 +242,35 @@ def imap_connect(user, app_password):
     return imap
 
 
-def find_last_message_id(imap, to_addr):
-    """คืน Message-ID ของเมลล่าสุดที่เราเคยส่งหา to_addr (เฉพาะเมล TRC Motorsport)"""
+SUBJECT_PREFIX = "TRC Motorsport ใบกำกับภาษี / ใบเสร็จรับเงิน"
+
+
+def find_last_message(imap, to_addr, prefix=SUBJECT_PREFIX, scan=40):
+    """หาเมลล่าสุดที่เคยส่งหา to_addr ซึ่งหัวเรื่องขึ้นต้นด้วย prefix (ไม่สนชื่อร้านท้ายหัวเรื่อง)
+    ดูย้อนหลัง scan ฉบับล่าสุด คืน (Message-ID, หัวเรื่อง) หรือ None"""
     q = f'"to:{to_addr} subject:Motorsport"'      # ต้องครอบด้วย " ไม่งั้น IMAP อ่านคำสั่งไม่ออก
     typ, data = imap.search(None, "X-GM-RAW", q)
     if typ != "OK" or not data or not data[0]:
         return None
-    last = data[0].split()[-1]
-    typ, msg = imap.fetch(last, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
-    if typ != "OK" or not msg or not msg[0]:
+    ids = data[0].split()[-scan:]
+    typ, msg = imap.fetch(b",".join(ids).decode(), "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID SUBJECT)])")
+    if typ != "OK" or not msg:
         return None
-    hdr = _email.message_from_bytes(msg[0][1])
-    mid = (hdr.get("Message-ID") or "").strip()
-    return mid or None
+    want = norm_subject(prefix)
+    found = []
+    for part in msg:
+        if not isinstance(part, tuple):
+            continue
+        head = part[0].split()[0]
+        hdr = _email.message_from_bytes(part[1])
+        mid = (hdr.get("Message-ID") or "").strip()
+        try:
+            subj = str(make_header(decode_header(hdr.get("Subject") or "")))
+        except Exception:
+            subj = hdr.get("Subject") or ""
+        if mid and norm_subject(subj).startswith(want):
+            found.append((int(head), mid, subj))
+    if not found:
+        return None
+    _, mid, subj = max(found)
+    return mid, subj
