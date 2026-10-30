@@ -237,7 +237,7 @@ def imap_connect(user, app_password):
 
 def find_last_message_id(imap, to_addr):
     """คืน Message-ID ของเมลล่าสุดที่เราเคยส่งหา to_addr (เฉพาะเมล TRC Motorsport)"""
-    q = f"to:{to_addr} subject:Motorsport"
+    q = f'"to:{to_addr} subject:Motorsport"'      # ต้องครอบด้วย " ไม่งั้น IMAP อ่านคำสั่งไม่ออก
     typ, data = imap.search(None, "X-GM-RAW", q)
     if typ != "OK" or not data or not data[0]:
         return None
