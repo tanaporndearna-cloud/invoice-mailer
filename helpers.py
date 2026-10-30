@@ -64,3 +64,56 @@ def split_batches(inv_list, pdfs, limit=MAX_MAIL_BYTES):
     if cur:
         batches.append(cur)
     return batches
+
+
+# ---------- โควต้า / ทรัพยากร ----------
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+TZ = ZoneInfo("Asia/Bangkok")
+DAILY_LIMIT = 500          # โควต้าเมล/วัน ของ Gmail ส่วนตัว
+UPLOAD_LIMIT_MB = 200      # ลิมิตของ Streamlit ต่อไฟล์
+
+
+def now_th():
+    return datetime.now(TZ)
+
+
+def count_sent_today(prev_dfs):
+    """นับจำนวน 'เมล' ที่ส่งสำเร็จวันนี้ จากไฟล์ผลการส่งที่อัปโหลด
+    (1 เมล = 1 คู่ อีเมล+เวลาส่ง) ไฟล์เก่าที่ไม่มีคอลัมน์เวลาจะไม่ถูกนับ"""
+    today = now_th().strftime("%Y-%m-%d")
+    mails = set()
+    for p in prev_dfs:
+        if "ส่งเมื่อ" not in p.columns:
+            continue
+        ok = p[(p["สถานะ"] == "สำเร็จ") & p["ส่งเมื่อ"].fillna("").str.startswith(today)]
+        mails |= set(zip(ok["email"], ok["ส่งเมื่อ"]))
+    return len(mails)
+
+
+def _read_int(path):
+    try:
+        v = open(path).read().strip()
+        return None if v == "max" else int(v)
+    except Exception:
+        return None
+
+
+def get_memory_mb():
+    """คืน (ใช้ไป MB, ลิมิต MB หรือ None) อ่านจาก cgroup ของ container"""
+    used = _read_int("/sys/fs/cgroup/memory.current") or _read_int(
+        "/sys/fs/cgroup/memory/memory.usage_in_bytes")
+    limit = _read_int("/sys/fs/cgroup/memory.max") or _read_int(
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes")
+    if limit and limit > 1 << 45:      # ค่า "ไม่จำกัด"
+        limit = None
+    if used is None:                   # สำรอง: RAM ของโปรเซสแอป
+        try:
+            for line in open("/proc/self/status"):
+                if line.startswith("VmRSS"):
+                    used = int(line.split()[1]) * 1024
+        except Exception:
+            pass
+    to_mb = lambda b: None if b is None else b / 1024 / 1024
+    return to_mb(used), to_mb(limit)
