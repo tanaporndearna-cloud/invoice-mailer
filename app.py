@@ -3,7 +3,7 @@ import pandas as pd
 import streamlit as st
 from helpers import (load_sheet, load_pdfs, split_batches, count_sent_today,
                      get_memory_mb, now_th, build_message, last_message_ids,
-                     imap_connect, find_last_message_id, DAILY_LIMIT, UPLOAD_LIMIT_MB)
+                     imap_connect, find_last_message, DAILY_LIMIT, UPLOAD_LIMIT_MB)
 
 st.set_page_config(page_title="ส่งใบกำกับภาษี", page_icon="📧")
 st.title("ส่งใบกำกับภาษีทางอีเมล")
@@ -127,38 +127,43 @@ if data_file and zip_files:
         if not mails:
             st.error("โควต้าวันนี้หมดแล้ว")
             st.stop()
-        reply_ids = last_message_ids(prev_dfs)      # สำรองจากไฟล์ผลการส่ง (ถ้ามี)
+        # reply_ids: {อีเมลผู้รับ: (Message-ID, หัวเรื่อง) ของเมล TRC Motorsport ล่าสุดที่เคยส่งหาคนนี้}
+        reply_ids, imap_ok = {}, False
         if use_thread:
             try:
                 with st.spinner("กำลังค้นเมลเดิมใน Gmail..."):
                     imap = imap_connect(st.secrets["EMAIL"], st.secrets["EMAIL_APP_PASSWORD"])
-                    found = 0
-                    for addr in sorted({str(e).strip().lower() for e, _, _ in mails}):
-                        mid0 = find_last_message_id(imap, addr)
-                        if mid0:
-                            reply_ids[addr] = mid0
-                            found += 1
+                    addrs = sorted({str(e).strip().lower() for e, _, _ in mails})
+                    for addr in addrs:
+                        res0 = find_last_message(imap, addr)
+                        if res0:
+                            reply_ids[addr] = res0
                     imap.logout()
-                st.info(f"พบเมลเดิมที่จะตอบกลับ {found} ราย จาก {len({str(e).lower() for e, _, _ in mails})} ราย "
-                        "(รายอื่นจะเป็นเมลใหม่)")
+                imap_ok = True
+                st.info(f"พบเมลเดิมที่จะตอบกลับ {len(reply_ids)} ราย จาก {len(addrs)} ราย "
+                        "(รายอื่นจะเป็นเมลใหม่ ไม่มี Re:)")
             except Exception as ex:
                 st.warning(f"ค้นเมลเดิมใน Gmail ไม่สำเร็จ ({ex}) จะส่งเป็นเมลใหม่ "
                            "(หรือใช้ข้อมูลจากไฟล์ผลการส่งถ้ามี)")
+        if not imap_ok:                              # สำรองจากไฟล์ผลการส่ง (ถ้ามี)
+            reply_ids = {k: (v, None) for k, v in last_message_ids(prev_dfs).items()}
         log, bar = [], st.progress(0)
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
             s.login(st.secrets["EMAIL"], st.secrets["EMAIL_APP_PASSWORD"])
             for i, (email, invs, info) in enumerate(mails):
                 try:
+                    k = str(email).strip().lower()
+                    rid, psub = reply_ids.get(k, (None, None))
                     m = build_message(st.secrets["EMAIL"],
                                       st.secrets.get("SENDER_NAME", ""),
                                       email, info["cust"], invs, pdfs,
                                       branch=info["branch"],
                                       cust_by_inv=info["cust_by_inv"],
-                                      reply_to_id=reply_ids.get(str(email).strip().lower()))
+                                      reply_to_id=rid, prev_subject=psub)
                     s.send_message(m)
                     res = "สำเร็จ"
                     mid = m["Message-ID"]
-                    reply_ids[str(email).strip().lower()] = mid
+                    reply_ids[k] = (mid, m["Subject"])
                 except Exception as e:
                     res, mid = f"ล้มเหลว: {e}", ""
                 t = now_th().strftime("%Y-%m-%d %H:%M:%S")
