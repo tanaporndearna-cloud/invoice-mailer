@@ -125,7 +125,7 @@ def get_memory_mb():
 
 # ---------- เนื้อหาอีเมล (แก้ข้อความได้ตรงนี้) ----------
 from email.message import EmailMessage
-from email.utils import formataddr
+from email.utils import formataddr, make_msgid
 import html as _html
 
 SIGNATURE_NAME = "Accounting officer"
@@ -133,12 +133,13 @@ SIGNATURE_COMPANY = "TRC motorsport"
 SIGNATURE_TEL = "Tel.02-746-8989 Ext.610"
 
 
-def build_subject(customer, branch=None):
+def build_subject(customer, branch=None, to=None):
     if branch:
         return f"TRC Motorsport ใบกำกับภาษี / ใบเสร็จรับเงิน (สาขา {branch} - รับหน้าสาขา)"
     if customer:
         return f"TRC Motorsport ใบกำกับภาษี / ใบเสร็จรับเงิน ( {customer} )"
-    return "TRC Motorsport ใบกำกับภาษี / ใบเสร็จรับเงิน"
+    # ไม่มีชื่อลูกค้า: ใส่อีเมลผู้รับต่อท้าย เพื่อให้ Gmail แยกเป็นกระทู้ของใครของมัน
+    return f"TRC Motorsport ใบกำกับภาษี / ใบเสร็จรับเงิน ( {to} )" if to else "TRC Motorsport ใบกำกับภาษี / ใบเสร็จรับเงิน"
 
 
 def build_bodies(sender_email, branch=None, items=None):
@@ -175,11 +176,17 @@ def build_bodies(sender_email, branch=None, items=None):
 
 
 def build_message(sender_email, sender_name, to, customer, invoices, pdfs,
-                  branch=None, cust_by_inv=None):
+                  branch=None, cust_by_inv=None, reply_to_id=None):
     m = EmailMessage()
     m["From"] = formataddr((sender_name, sender_email)) if sender_name else sender_email
     m["To"] = to
-    m["Subject"] = build_subject(customer, branch)
+    subject = build_subject(customer, branch, to)
+    m["Message-ID"] = make_msgid(domain=sender_email.split("@")[-1])
+    if reply_to_id:                      # ตอบกลับเมลเดิมของผู้รับคนนี้
+        subject = "Re: " + subject
+        m["In-Reply-To"] = reply_to_id
+        m["References"] = reply_to_id
+    m["Subject"] = subject
     items = [(i, (cust_by_inv or {}).get(i, "")) for i in invoices]
     text, html = build_bodies(sender_email, branch, items)
     m.set_content(text)
@@ -188,3 +195,56 @@ def build_message(sender_email, sender_name, to, customer, invoices, pdfs,
         m.add_attachment(pdfs[inv], maintype="application", subtype="pdf",
                          filename=f"{inv}.pdf")
     return m
+
+
+def last_message_ids(prev_dfs):
+    """{อีเมลผู้รับ(ตัวเล็ก): Message-ID ของเมลล่าสุดที่ส่งสำเร็จ} จากไฟล์ผลการส่งเก่า"""
+    best = {}
+    for p in prev_dfs:
+        if "message_id" not in p.columns or "ส่งเมื่อ" not in p.columns:
+            continue
+        ok = p[(p["สถานะ"] == "สำเร็จ") & p["message_id"].notna() & p["email"].notna()]
+        for _, r in ok.iterrows():
+            k = str(r["email"]).strip().lower()
+            if k not in best or str(r["ส่งเมื่อ"]) > best[k][0]:
+                best[k] = (str(r["ส่งเมื่อ"]), r["message_id"])
+    return {k: v[1] for k, v in best.items()}
+
+
+# ---------- ค้นเมลเดิมจากโฟลเดอร์ "ส่งแล้ว" ของ Gmail (IMAP) ----------
+import imaplib, email as _email
+
+
+def _sent_folder(imap):
+    """หาชื่อโฟลเดอร์ส่งแล้ว จาก flag \\Sent (ชื่อเปลี่ยนตามภาษาของบัญชี)"""
+    typ, boxes = imap.list()
+    for b in boxes or []:
+        line = b.decode("utf-8", "ignore") if isinstance(b, bytes) else str(b)
+        if "\\Sent" in line:
+            name = line.rsplit(' "/" ', 1)[-1].strip()
+            return name
+    return '"[Gmail]/Sent Mail"'
+
+
+def imap_connect(user, app_password):
+    imap = imaplib.IMAP4_SSL("imap.gmail.com")
+    imap.login(user, app_password)
+    typ, _ = imap.select(_sent_folder(imap), readonly=True)
+    if typ != "OK":
+        raise RuntimeError("เปิดโฟลเดอร์ส่งแล้วไม่ได้")
+    return imap
+
+
+def find_last_message_id(imap, to_addr):
+    """คืน Message-ID ของเมลล่าสุดที่เราเคยส่งหา to_addr (เฉพาะเมล TRC Motorsport)"""
+    q = f"to:{to_addr} subject:Motorsport"
+    typ, data = imap.search(None, "X-GM-RAW", q)
+    if typ != "OK" or not data or not data[0]:
+        return None
+    last = data[0].split()[-1]
+    typ, msg = imap.fetch(last, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
+    if typ != "OK" or not msg or not msg[0]:
+        return None
+    hdr = _email.message_from_bytes(msg[0][1])
+    mid = (hdr.get("Message-ID") or "").strip()
+    return mid or None
