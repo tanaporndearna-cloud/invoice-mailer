@@ -2,7 +2,8 @@ import smtplib, time
 import pandas as pd
 import streamlit as st
 from helpers import (load_sheet, load_pdfs, split_batches, count_sent_today,
-                     get_memory_mb, now_th, build_message, DAILY_LIMIT, UPLOAD_LIMIT_MB)
+                     get_memory_mb, now_th, build_message, last_message_ids,
+                     imap_connect, find_last_message_id, DAILY_LIMIT, UPLOAD_LIMIT_MB)
 
 st.set_page_config(page_title="ส่งใบกำกับภาษี", page_icon="📧")
 st.title("ส่งใบกำกับภาษีทางอีเมล")
@@ -113,11 +114,31 @@ if data_file and zip_files:
         st.warning(f"เมลที่ต้องส่ง ({len(mails)}) เกินโควต้าที่เหลือ ({remaining}) "
                    f"ระบบจะส่งแค่ {remaining} เมลแรก ที่เหลือส่งพรุ่งนี้")
 
+    use_thread = st.checkbox("ตอบกลับเมลเดิมของผู้รับ (ค้นจากโฟลเดอร์ 'ส่งแล้ว' ใน Gmail ไม่ต้องอัปโหลดข้อ 3)",
+                             value=True)
+
     if st.button("เริ่มส่งอีเมล") and len(ready):
         mails = mails[:remaining]
         if not mails:
             st.error("โควต้าวันนี้หมดแล้ว")
             st.stop()
+        reply_ids = last_message_ids(prev_dfs)      # สำรองจากไฟล์ผลการส่ง (ถ้ามี)
+        if use_thread:
+            try:
+                with st.spinner("กำลังค้นเมลเดิมใน Gmail..."):
+                    imap = imap_connect(st.secrets["EMAIL"], st.secrets["EMAIL_APP_PASSWORD"])
+                    found = 0
+                    for addr in sorted({str(e).strip().lower() for e, _, _ in mails}):
+                        mid0 = find_last_message_id(imap, addr)
+                        if mid0:
+                            reply_ids[addr] = mid0
+                            found += 1
+                    imap.logout()
+                st.info(f"พบเมลเดิมที่จะตอบกลับ {found} ราย จาก {len({str(e).lower() for e, _, _ in mails})} ราย "
+                        "(รายอื่นจะเป็นเมลใหม่)")
+            except Exception as ex:
+                st.warning(f"ค้นเมลเดิมใน Gmail ไม่สำเร็จ ({ex}) จะส่งเป็นเมลใหม่ "
+                           "(หรือใช้ข้อมูลจากไฟล์ผลการส่งถ้ามี)")
         log, bar = [], st.progress(0)
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
             s.login(st.secrets["EMAIL"], st.secrets["EMAIL_APP_PASSWORD"])
@@ -127,17 +148,20 @@ if data_file and zip_files:
                                       st.secrets.get("SENDER_NAME", ""),
                                       email, info["cust"], invs, pdfs,
                                       branch=info["branch"],
-                                      cust_by_inv=info["cust_by_inv"])
+                                      cust_by_inv=info["cust_by_inv"],
+                                      reply_to_id=reply_ids.get(str(email).strip().lower()))
                     s.send_message(m)
                     res = "สำเร็จ"
+                    mid = m["Message-ID"]
+                    reply_ids[str(email).strip().lower()] = mid
                 except Exception as e:
-                    res = f"ล้มเหลว: {e}"
+                    res, mid = f"ล้มเหลว: {e}", ""
                 t = now_th().strftime("%Y-%m-%d %H:%M:%S")
                 for inv in invs:
-                    log.append((inv, email, res, t))
+                    log.append((inv, email, res, t, mid))
                 bar.progress((i + 1) / len(mails))
                 time.sleep(1)
-        out = pd.DataFrame(log, columns=["invoice_no", "email", "สถานะ", "ส่งเมื่อ"])
+        out = pd.DataFrame(log, columns=["invoice_no", "email", "สถานะ", "ส่งเมื่อ", "message_id"])
         st.dataframe(out)
         st.download_button("ดาวน์โหลดผลการส่ง",
                            out.to_csv(index=False).encode("utf-8-sig"), f"result_{now_th():%Y-%m-%d_%H%M}.csv")
