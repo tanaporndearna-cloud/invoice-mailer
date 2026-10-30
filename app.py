@@ -58,28 +58,51 @@ if data_file and zip_files:
     if prev_files:
         st.caption(f"โหลดประวัติการส่งแล้ว {len(sent_before)} ใบ จาก {len(prev_files)} ไฟล์")
 
+    # อีเมลสาขา อ่านจาก Secrets: [BRANCH_EMAILS]  T4 = "xxx@gmail.com"
+    try:
+        branch_map = {str(k).strip().upper(): str(v).strip()
+                      for k, v in dict(st.secrets["BRANCH_EMAILS"]).items()}
+    except Exception:
+        branch_map = {}
+
+    def target(r):
+        if r["via_email"]:  return r["email"]
+        if r["via_branch"]: return branch_map.get(r["branch"]) or None
+        return None
+
+    df["ส่งไปที่"] = df.apply(target, axis=1)
+    df["ประเภท"] = df.apply(
+        lambda r: "ลูกค้า" if r["via_email"] else ("สาขา" if r["via_branch"] else "-"), axis=1)
+
     def status(r):
-        if not r["via_email"]:             return "ช่องทางอื่น (ไม่ส่ง)"
-        if not r["email"]:                 return "อีเมลไม่ถูกต้อง/ว่าง"
+        if not r["via_email"] and not r["via_branch"]:
+            return "ช่องทางอื่น (ไม่ส่ง)"
+        if r["via_branch"] and not r["via_email"] and not r["ส่งไปที่"]:
+            return f"ไม่มีอีเมลสาขา ({r['branch'] or 'ว่าง'})"
+        if not r["ส่งไปที่"]:              return "อีเมลไม่ถูกต้อง/ว่าง"
         if r["invoice_no"] in sent_before: return "ส่งไปแล้ว"
         if r["invoice_no"] not in pdfs:    return "ไม่พบ PDF"
         return "พร้อมส่ง"
 
     df["สถานะ"] = df.apply(status, axis=1)
-    st.dataframe(df[["invoice_no", "channel", "email", "สถานะ"]])
+    st.dataframe(df[["invoice_no", "channel", "branch", "ประเภท", "ส่งไปที่", "สถานะ"]])
     ready = df[df["สถานะ"] == "พร้อมส่ง"]
 
     # จำนวนเมลที่จะส่งจริง (รวมลูกค้าคนเดียวหลายใบ และแบ่งตามขนาด)
     mails = []
-    for email, g in ready.groupby("email"):
+    for (email, kind), g in ready.groupby(["ส่งไปที่", "ประเภท"]):
         names = [str(n).strip() for n in g["customer"].dropna().unique()]
-        cust = " / ".join(names)
+        info = {
+            "cust": " / ".join(names),
+            "branch": g["branch"].iloc[0] if kind == "สาขา" else None,
+            "cust_by_inv": dict(zip(g["invoice_no"], g["customer"].fillna(""))),
+        }
         for batch in split_batches(list(g["invoice_no"]), pdfs):
-            mails.append((email, batch, cust))
+            mails.append((email, batch, info))
 
     used_today = count_sent_today(prev_dfs)
     remaining = max(DAILY_LIMIT - used_today, 0)
-    st.write(f"พร้อมส่ง {len(ready)} ใบ = **{len(mails)} เมล** / {ready['email'].nunique()} อีเมล")
+    st.write(f"พร้อมส่ง {len(ready)} ใบ = **{len(mails)} เมล** / {ready['ส่งไปที่'].nunique()} อีเมล")
     c1, c2, c3 = st.columns(3)
     c1.metric("ส่งแล้ววันนี้", used_today)
     c2.metric("โควต้าเหลือ", f"{remaining} / {DAILY_LIMIT}")
@@ -98,11 +121,13 @@ if data_file and zip_files:
         log, bar = [], st.progress(0)
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
             s.login(st.secrets["EMAIL"], st.secrets["EMAIL_APP_PASSWORD"])
-            for i, (email, invs, cust) in enumerate(mails):
+            for i, (email, invs, info) in enumerate(mails):
                 try:
                     m = build_message(st.secrets["EMAIL"],
                                       st.secrets.get("SENDER_NAME", ""),
-                                      email, cust, invs, pdfs)
+                                      email, info["cust"], invs, pdfs,
+                                      branch=info["branch"],
+                                      cust_by_inv=info["cust_by_inv"])
                     s.send_message(m)
                     res = "สำเร็จ"
                 except Exception as e:
