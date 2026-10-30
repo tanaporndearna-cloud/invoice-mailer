@@ -14,6 +14,7 @@ def load_sheet(f):
         raw = pd.read_excel(f, header=1, dtype=str)
     d = pd.DataFrame({
         "invoice_no": raw.iloc[:, 1],
+        "branch": raw.iloc[:, 2],                 # คอลัมน์ C (สาขา เช่น T4)
         "customer": raw.iloc[:, 4],
         "channel": raw.iloc[:, 13],
         "email_raw": raw.iloc[:, 14],
@@ -28,7 +29,9 @@ def load_sheet(f):
         return m.group(0).lower() if m else None
 
     d["email"] = d["email_raw"].map(get_email)
+    d["branch"] = d["branch"].fillna("").astype(str).str.strip().str.upper()
     d["via_email"] = d["channel"].fillna("").str.contains("อีเมล")
+    d["via_branch"] = d["channel"].fillna("").str.contains("รับหน้าสาขา")
     return d
 
 
@@ -130,17 +133,30 @@ SIGNATURE_COMPANY = "TRC motorsport"
 SIGNATURE_TEL = "Tel.02-746-8989 Ext.610"
 
 
-def build_subject(customer):
+def build_subject(customer, branch=None):
+    if branch:
+        return f"TRC Motorsport ใบกำกับภาษี / ใบเสร็จรับเงิน (สาขา {branch} - รับหน้าสาขา)"
     if customer:
         return f"TRC Motorsport ใบกำกับภาษี / ใบเสร็จรับเงิน ( {customer} )"
     return "TRC Motorsport ใบกำกับภาษี / ใบเสร็จรับเงิน"
 
 
-def build_bodies(sender_email):
+def build_bodies(sender_email, branch=None, items=None):
+    """items = [(เลขที่ใบกำกับ, ชื่อลูกค้า)] ใช้กรณีส่งเข้าสาขา"""
+    items = items or []
+    list_text = ""
+    list_html = ""
+    if branch:
+        list_text = f"สาขา {branch} รายการใบกำกับที่แนบ:\n" + "".join(
+            f"  - {i}  {c}\n" for i, c in items) + "\n"
+        rows = "".join(f"<li>{_html.escape(i)} &nbsp; {_html.escape(c)}</li>" for i, c in items)
+        list_html = (f'<p style="color:#1a4f9c;">สาขา {_html.escape(branch)} '
+                     f'รายการใบกำกับที่แนบ:</p><ul style="color:#1a4f9c;">{rows}</ul>')
     text = (
         "เรียน บัญชี/การเงิน\n"
         "เรื่อง ใบเสร็จรับเงิน/ใบกำกับภาษี\n\n"
         "    ตามไฟล์ที่แนบมานี้ ค่ะ\n\n"
+        + list_text +
         "Kindly Regards,\n"
         f"{SIGNATURE_NAME}\n{SIGNATURE_COMPANY}\n"
         f"Email : {sender_email}\n{SIGNATURE_TEL}\n"
@@ -150,7 +166,7 @@ def build_bodies(sender_email):
     html = f"""<div style="font-family:Tahoma,'Comic Sans MS',sans-serif;font-size:14px;">
 <p style="{blue}">เรียน บัญชี/การเงิน<br>เรื่อง ใบเสร็จรับเงิน/ใบกำกับภาษี</p>
 <p style="{blue}">&nbsp;&nbsp;&nbsp;&nbsp;ตามไฟล์ที่แนบมานี้ &nbsp; ค่ะ</p>
-<br>
+{list_html}<br>
 <p style="margin:0;"><b>Kindly Regards,</b></p>
 <p style="margin:0;color:#444;"><i>{e(SIGNATURE_NAME)}<br>{e(SIGNATURE_COMPANY)}</i></p>
 <p style="color:#444;"><i>Email : <a href="mailto:{e(sender_email)}">{e(sender_email)}</a><br>{e(SIGNATURE_TEL)}</i></p>
@@ -158,12 +174,14 @@ def build_bodies(sender_email):
     return text, html
 
 
-def build_message(sender_email, sender_name, to, customer, invoices, pdfs):
+def build_message(sender_email, sender_name, to, customer, invoices, pdfs,
+                  branch=None, cust_by_inv=None):
     m = EmailMessage()
     m["From"] = formataddr((sender_name, sender_email)) if sender_name else sender_email
     m["To"] = to
-    m["Subject"] = build_subject(customer)
-    text, html = build_bodies(sender_email)
+    m["Subject"] = build_subject(customer, branch)
+    items = [(i, (cust_by_inv or {}).get(i, "")) for i in invoices]
+    text, html = build_bodies(sender_email, branch, items)
     m.set_content(text)
     m.add_alternative(html, subtype="html")
     for inv in invoices:
