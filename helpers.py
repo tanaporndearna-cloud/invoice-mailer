@@ -14,6 +14,7 @@ def load_sheet(f):
         raw = pd.read_excel(f, header=1, dtype=str)
     d = pd.DataFrame({
         "invoice_no": raw.iloc[:, 1],
+        "customer": raw.iloc[:, 4],
         "channel": raw.iloc[:, 13],
         "email_raw": raw.iloc[:, 14],
     })
@@ -117,3 +118,55 @@ def get_memory_mb():
             pass
     to_mb = lambda b: None if b is None else b / 1024 / 1024
     return to_mb(used), to_mb(limit)
+
+
+# ---------- เนื้อหาอีเมล (แก้ข้อความได้ตรงนี้) ----------
+from email.message import EmailMessage
+from email.utils import formataddr
+import html as _html
+
+SIGNATURE_NAME = "Accounting officer"
+SIGNATURE_COMPANY = "TRC motorsport"
+SIGNATURE_TEL = "Tel.02-746-8989 Ext.610"
+
+
+def build_subject(customer):
+    if customer:
+        return f"TRC Motorsport ใบกำกับภาษี / ใบเสร็จรับเงิน ( {customer} )"
+    return "TRC Motorsport ใบกำกับภาษี / ใบเสร็จรับเงิน"
+
+
+def build_bodies(sender_email):
+    text = (
+        "เรียน บัญชี/การเงิน\n"
+        "เรื่อง ใบเสร็จรับเงิน/ใบกำกับภาษี\n\n"
+        "    ตามไฟล์ที่แนบมานี้ ค่ะ\n\n"
+        "Kindly Regards,\n"
+        f"{SIGNATURE_NAME}\n{SIGNATURE_COMPANY}\n"
+        f"Email : {sender_email}\n{SIGNATURE_TEL}\n"
+    )
+    e = _html.escape
+    blue = "color:#1a4f9c;font-weight:bold;"
+    html = f"""<div style="font-family:Tahoma,'Comic Sans MS',sans-serif;font-size:14px;">
+<p style="{blue}">เรียน บัญชี/การเงิน<br>เรื่อง ใบเสร็จรับเงิน/ใบกำกับภาษี</p>
+<p style="{blue}">&nbsp;&nbsp;&nbsp;&nbsp;ตามไฟล์ที่แนบมานี้ &nbsp; ค่ะ</p>
+<br>
+<p style="margin:0;"><b>Kindly Regards,</b></p>
+<p style="margin:0;color:#444;"><i>{e(SIGNATURE_NAME)}<br>{e(SIGNATURE_COMPANY)}</i></p>
+<p style="color:#444;"><i>Email : <a href="mailto:{e(sender_email)}">{e(sender_email)}</a><br>{e(SIGNATURE_TEL)}</i></p>
+</div>"""
+    return text, html
+
+
+def build_message(sender_email, sender_name, to, customer, invoices, pdfs):
+    m = EmailMessage()
+    m["From"] = formataddr((sender_name, sender_email)) if sender_name else sender_email
+    m["To"] = to
+    m["Subject"] = build_subject(customer)
+    text, html = build_bodies(sender_email)
+    m.set_content(text)
+    m.add_alternative(html, subtype="html")
+    for inv in invoices:
+        m.add_attachment(pdfs[inv], maintype="application", subtype="pdf",
+                         filename=f"{inv}.pdf")
+    return m
