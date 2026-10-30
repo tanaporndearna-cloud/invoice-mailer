@@ -1,9 +1,8 @@
 import smtplib, time
 import pandas as pd
 import streamlit as st
-from email.message import EmailMessage
 from helpers import (load_sheet, load_pdfs, split_batches, count_sent_today,
-                     get_memory_mb, now_th, DAILY_LIMIT, UPLOAD_LIMIT_MB)
+                     get_memory_mb, now_th, build_message, DAILY_LIMIT, UPLOAD_LIMIT_MB)
 
 st.set_page_config(page_title="ส่งใบกำกับภาษี", page_icon="📧")
 st.title("ส่งใบกำกับภาษีทางอีเมล")
@@ -73,8 +72,10 @@ if data_file and zip_files:
     # จำนวนเมลที่จะส่งจริง (รวมลูกค้าคนเดียวหลายใบ และแบ่งตามขนาด)
     mails = []
     for email, g in ready.groupby("email"):
+        names = [str(n).strip() for n in g["customer"].dropna().unique()]
+        cust = " / ".join(names)
         for batch in split_batches(list(g["invoice_no"]), pdfs):
-            mails.append((email, batch))
+            mails.append((email, batch, cust))
 
     used_today = count_sent_today(prev_dfs)
     remaining = max(DAILY_LIMIT - used_today, 0)
@@ -97,16 +98,11 @@ if data_file and zip_files:
         log, bar = [], st.progress(0)
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
             s.login(st.secrets["EMAIL"], st.secrets["EMAIL_APP_PASSWORD"])
-            for i, (email, invs) in enumerate(mails):
+            for i, (email, invs, cust) in enumerate(mails):
                 try:
-                    m = EmailMessage()
-                    m["From"] = st.secrets["EMAIL"]
-                    m["To"] = email
-                    m["Subject"] = "ใบกำกับภาษีเลขที่ " + ", ".join(invs)
-                    m.set_content("เรียนลูกค้า\n\nแนบใบกำกับภาษีมาพร้อมอีเมลนี้ค่ะ\n\nขอบคุณค่ะ")
-                    for inv in invs:
-                        m.add_attachment(pdfs[inv], maintype="application",
-                                         subtype="pdf", filename=f"{inv}.pdf")
+                    m = build_message(st.secrets["EMAIL"],
+                                      st.secrets.get("SENDER_NAME", ""),
+                                      email, cust, invs, pdfs)
                     s.send_message(m)
                     res = "สำเร็จ"
                 except Exception as e:
