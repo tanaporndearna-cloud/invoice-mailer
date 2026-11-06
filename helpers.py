@@ -30,8 +30,10 @@ def load_sheet(f):
 
     d["email"] = d["email_raw"].map(get_email)
     d["branch"] = d["branch"].fillna("").astype(str).str.strip().str.upper()
-    d["via_email"] = d["channel"].fillna("").str.contains("อีเมล")
-    d["via_branch"] = d["channel"].fillna("").str.contains("รับหน้าสาขา")
+    ch = d["channel"].fillna("")
+    # ส่งเข้าสาขา: "รับหน้าสาขา" และ "ส่งหน้าร้าน" (ไม่ส่งหาลูกค้าเด็ดขาด แม้ช่องอีเมลมีค่า)
+    d["via_branch"] = ch.str.contains("รับหน้าสาขา|ส่งหน้าร้าน")
+    d["via_email"] = ch.str.contains("อีเมล") & ~d["via_branch"]
     return d
 
 
@@ -133,9 +135,16 @@ SIGNATURE_COMPANY = "TRC motorsport"
 SIGNATURE_TEL = "Tel.02-746-8989 Ext.610"
 
 
+# หัวเรื่องเมลสาขาที่ "จำไว้" (สาขาที่ใช้หัวเรื่องต่างจากแบบมาตรฐาน ต้องคงไว้เพื่อให้ต่อกระทู้เดิม)
+# สาขาอื่นๆ ใช้แบบมาตรฐาน: TRC Motorsport ใบกำกับภาษี / ใบเสร็จรับเงิน ( สาขา Tx )
+BRANCH_SUBJECTS = {
+    "T18": "TRC Motorsport ใบกำกับภาษี / ใบเสร็จรับเงิน (สาขา T18 - รับหน้าสาขา )",
+}
+
+
 def build_subject(customer, branch=None, to=None):
     if branch:
-        return f"TRC Motorsport ใบกำกับภาษี / ใบเสร็จรับเงิน (สาขา {branch} - รับหน้าสาขา)"
+        return BRANCH_SUBJECTS.get(branch) or f"TRC Motorsport ใบกำกับภาษี / ใบเสร็จรับเงิน ( สาขา {branch} )"
     if customer:
         return f"TRC Motorsport ใบกำกับภาษี / ใบเสร็จรับเงิน ( {customer} )"
     # ไม่มีชื่อลูกค้า: ใส่อีเมลผู้รับต่อท้าย เพื่อให้ Gmail แยกเป็นกระทู้ของใครของมัน
@@ -153,8 +162,9 @@ def build_bodies(sender_email, branch=None, items=None):
         rows = "".join(f"<li>{_html.escape(i)} &nbsp; {_html.escape(c)}</li>" for i, c in items)
         list_html = (f'<p style="color:#1a4f9c;">สาขา {_html.escape(branch)} '
                      f'รายการใบกำกับที่แนบ:</p><ul style="color:#1a4f9c;">{rows}</ul>')
+    greet = f"สาขา {branch}" if branch else "บัญชี/การเงิน"
     text = (
-        "เรียน บัญชี/การเงิน\n"
+        f"เรียน {greet}\n"
         "เรื่อง ใบเสร็จรับเงิน/ใบกำกับภาษี\n\n"
         "    ตามไฟล์ที่แนบมานี้ ค่ะ\n\n"
         + list_text +
@@ -165,7 +175,7 @@ def build_bodies(sender_email, branch=None, items=None):
     e = _html.escape
     blue = "color:#1a4f9c;font-weight:bold;"
     html = f"""<div style="font-family:Tahoma,'Comic Sans MS',sans-serif;font-size:14px;">
-<p style="{blue}">เรียน บัญชี/การเงิน<br>เรื่อง ใบเสร็จรับเงิน/ใบกำกับภาษี</p>
+<p style="{blue}">เรียน {e(greet)}<br>เรื่อง ใบเสร็จรับเงิน/ใบกำกับภาษี</p>
 <p style="{blue}">&nbsp;&nbsp;&nbsp;&nbsp;ตามไฟล์ที่แนบมานี้ &nbsp; ค่ะ</p>
 {list_html}<br>
 <p style="margin:0;"><b>Kindly Regards,</b></p>
@@ -180,16 +190,30 @@ def norm_subject(s):
     return re.sub(r"\s+", " ", s).strip()
 
 
+def plan_subject(customer, branch, to, reply_to_id=None, prev_subject=None):
+    """คืน (หัวเรื่องที่จะใช้, reply_to_id ที่ใช้จริง) กติกาเดียวกับตอนสร้างเมล ใช้แสดงในตารางก่อนส่งด้วย"""
+    subject = build_subject(customer, branch, to)
+    # กันพลาด: เมลสาขาตอบกลับได้เฉพาะเมลที่หัวเรื่องเป็นของสาขานั้นเท่านั้น ห้ามต่อกับหัวเรื่องลูกค้าเด็ดขาด
+    if reply_to_id and branch:
+        if not prev_subject or not re.search(r"\(\s*สาขา\s+" + re.escape(branch) + r"\b", prev_subject, re.I):
+            reply_to_id = None
+    if reply_to_id:
+        # เมลสาขาใช้หัวเรื่องที่จำไว้เสมอ เมลลูกค้าใช้หัวเรื่องเดิมของเมลก่อนหน้า (ให้ Gmail ต่อกระทู้เดิม)
+        base = subject if branch else (norm_subject(prev_subject) if prev_subject else subject)
+        subject = "Re: " + base
+    return subject, reply_to_id
+
+
 def build_message(sender_email, sender_name, to, customer, invoices, pdfs,
-                  branch=None, cust_by_inv=None, reply_to_id=None, prev_subject=None):
+                  branch=None, cust_by_inv=None, reply_to_id=None, prev_subject=None, cc=None):
     m = EmailMessage()
     m["From"] = formataddr((sender_name, sender_email)) if sender_name else sender_email
     m["To"] = to
-    subject = build_subject(customer, branch, to)
+    if cc:                               # สำเนา (CC) ทั้งเมลสาขาและเมลลูกค้า
+        m["Cc"] = cc
     m["Message-ID"] = make_msgid(domain=sender_email.split("@")[-1])
+    subject, reply_to_id = plan_subject(customer, branch, to, reply_to_id, prev_subject)
     if reply_to_id:                      # ตอบกลับเมลเดิมของผู้รับคนนี้
-        # ใช้หัวเรื่องเดิม (ไม่สนชื่อร้านใหม่) เพื่อให้ Gmail ต่อเข้ากระทู้เดิม
-        subject = "Re: " + (norm_subject(prev_subject) if prev_subject else subject)
         m["In-Reply-To"] = reply_to_id
         m["References"] = reply_to_id
     m["Subject"] = subject
@@ -245,18 +269,30 @@ def imap_connect(user, app_password):
 SUBJECT_PREFIX = "TRC Motorsport ใบกำกับภาษี / ใบเสร็จรับเงิน"
 
 
-def find_last_message(imap, to_addr, prefix=SUBJECT_PREFIX, scan=40):
-    """หาเมลล่าสุดที่เคยส่งหา to_addr ซึ่งหัวเรื่องขึ้นต้นด้วย prefix (ไม่สนชื่อร้านท้ายหัวเรื่อง)
-    ดูย้อนหลัง scan ฉบับล่าสุด คืน (Message-ID, หัวเรื่อง) หรือ None"""
-    q = f'"to:{to_addr} subject:Motorsport"'      # ต้องครอบด้วย " ไม่งั้น IMAP อ่านคำสั่งไม่ออก
+def _addr_set(s):
+    from email.utils import getaddresses
+    return {a.strip().lower() for _, a in getaddresses([str(s or "")]) if a.strip()}
+
+
+def find_last_message(imap, to_addr, branch=None, prefix=SUBJECT_PREFIX, scan=60):
+    """หาเมลล่าสุดที่เคยส่งหา to_addr (คืน (Message-ID, หัวเรื่อง) หรือ None)
+    - ต้องส่งถึง 'ผู้รับชุดนี้เท่านั้น' (ช่อง To ตรงเป๊ะ ไม่มีคนอื่นปน)
+    - branch = รหัสสาขา -> ต้องเป็นเมลสาขาของสาขานั้นเท่านั้น (หัวเรื่อง "(สาขา Tx - รับหน้าสาขา)")
+    - branch = None -> เมลลูกค้า หัวเรื่องขึ้นต้น prefix และ *ไม่ใช่* เมลรับหน้าสาขา"""
+    want_rec = _addr_set(to_addr)
+    first = sorted(want_rec)[0] if want_rec else str(to_addr)
+    q = f'"to:{first} subject:Motorsport"'      # ต้องครอบด้วย " ไม่งั้น IMAP อ่านคำสั่งไม่ออก
     typ, data = imap.search(None, "X-GM-RAW", q)
     if typ != "OK" or not data or not data[0]:
         return None
     ids = data[0].split()[-scan:]
-    typ, msg = imap.fetch(b",".join(ids).decode(), "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID SUBJECT)])")
+    typ, msg = imap.fetch(b",".join(ids).decode(), "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID SUBJECT TO)])")
     if typ != "OK" or not msg:
         return None
-    want = norm_subject(prefix)
+    want_cust = norm_subject(prefix)
+    # หัวเรื่องเมลสาขา: "( สาขา T2 )" (รองรับรูปแบบเก่า "(สาขา T2 - รับหน้าสาขา)" ด้วย)
+    branch_re = re.compile(r"\(\s*สาขา\s+" + re.escape(branch) + r"\b", re.I) if branch else None
+    any_branch_re = re.compile(r"\(\s*สาขา\s")
     found = []
     for part in msg:
         if not isinstance(part, tuple):
@@ -268,7 +304,14 @@ def find_last_message(imap, to_addr, prefix=SUBJECT_PREFIX, scan=40):
             subj = str(make_header(decode_header(hdr.get("Subject") or "")))
         except Exception:
             subj = hdr.get("Subject") or ""
-        if mid and norm_subject(subj).startswith(want):
+        if not mid or _addr_set(hdr.get("To")) != want_rec:
+            continue
+        ns = norm_subject(subj)
+        if branch:
+            ok = ns.startswith(want_cust) and bool(branch_re.search(ns))
+        else:
+            ok = ns.startswith(want_cust) and not any_branch_re.search(ns) and "รับหน้าสาขา" not in ns
+        if ok:
             found.append((int(head), mid, subj))
     if not found:
         return None
