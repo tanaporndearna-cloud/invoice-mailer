@@ -1,9 +1,9 @@
-import smtplib, time
+import re, smtplib, time
 import pandas as pd
 import streamlit as st
 from helpers import (load_sheet, load_pdfs, split_batches, count_sent_today,
                      get_memory_mb, now_th, build_message, last_message_ids,
-                     imap_connect, find_last_message, DAILY_LIMIT, UPLOAD_LIMIT_MB)
+                     imap_connect, find_last_message, plan_subject, DAILY_LIMIT, UPLOAD_LIMIT_MB)
 
 st.set_page_config(page_title="ส่งใบกำกับภาษี", page_icon="📧")
 st.title("ส่งใบกำกับภาษีทางอีเมล")
@@ -48,6 +48,11 @@ with st.sidebar:
     quota_box = st.container()
     if not (data_file and zip_files):
         quota_box.caption(f"อัปโหลดไฟล์ข้อ 1 และ 2 ก่อน จะแสดงโควต้า (เต็ม {DAILY_LIMIT} เมล/วัน)")
+
+# CC ทุกเมล (สาขา + ลูกค้า): ตั้งใน Secrets ที่ CC_EMAIL (หรือ BRANCH_CC ชื่อเดิม)
+CC = str(st.secrets.get("CC_EMAIL", st.secrets.get("BRANCH_CC", ""))).strip()
+N_CC = len([x for x in CC.split(",") if x.strip()])
+MAIL_LIMIT = DAILY_LIMIT // (1 + N_CC)        # Gmail นับตามจำนวนผู้รับ (To + CC)
 
 if data_file and zip_files:
     df = load_sheet(data_file)
@@ -107,14 +112,15 @@ if data_file and zip_files:
             mails.append((email, batch, info))
 
     used_today = count_sent_today(prev_dfs)
-    remaining = max(DAILY_LIMIT - used_today, 0)
+    remaining = max(MAIL_LIMIT - used_today, 0)
     st.write(f"พร้อมส่ง {len(ready)} ใบ = **{len(mails)} เมล** / {ready['ส่งไปที่'].nunique()} อีเมล")
     with quota_box:
-        st.progress(min(used_today / DAILY_LIMIT, 1.0))
-        st.write(f"ส่งแล้ววันนี้: **{used_today}** / {DAILY_LIMIT}")
+        st.progress(min(used_today / MAIL_LIMIT, 1.0))
+        st.write(f"ส่งแล้ววันนี้: **{used_today}** / {MAIL_LIMIT} เมล")
         st.write(f"โควต้าเหลือ: **{remaining}**")
         st.write(f"หลังส่งรอบนี้เหลือ: **{max(remaining - len(mails), 0)}**")
-        st.caption("นับจากไฟล์ผลการส่งที่อัปโหลดในช่องที่ 3 เท่านั้น ไม่รวมเมลที่ส่งจากทางอื่นด้วยบัญชีเดียวกัน")
+        st.caption(f"Gmail จำกัด {DAILY_LIMIT} ผู้รับ/วัน (นับ To + CC) เมลละ {1 + N_CC} ผู้รับ จึงส่งได้ {MAIL_LIMIT} เมล "
+                   "นับจากไฟล์ผลการส่งที่อัปโหลดในช่องที่ 3 เท่านั้น ไม่รวมเมลที่ส่งจากทางอื่นด้วยบัญชีเดียวกัน")
     if len(mails) > remaining:
         st.warning(f"เมลที่ต้องส่ง ({len(mails)}) เกินโควต้าที่เหลือ ({remaining}) "
                    f"ระบบจะส่งแค่ {remaining} เมลแรก ที่เหลือส่งพรุ่งนี้")
@@ -122,44 +128,75 @@ if data_file and zip_files:
     use_thread = st.checkbox("ตอบกลับเมลเดิมของผู้รับ (ค้นจากโฟลเดอร์ 'ส่งแล้ว' ใน Gmail ไม่ต้องอัปโหลดข้อ 3)",
                              value=True)
 
-    if st.button("เริ่มส่งอีเมล") and len(ready):
+    # cache ผลค้นเมลเดิม: {(อีเมลผู้รับ, สาขา|None): (Message-ID, หัวเรื่อง) หรือ None ถ้าไม่พบ}
+    cache = st.session_state.setdefault("reply_cache", {})
+    keys = sorted({(str(e).strip().lower(), inf["branch"]) for e, _, inf in mails},
+                  key=lambda x: (x[0], x[1] or ""))
+    if use_thread and mails and st.button("ตรวจหาเมลเดิมที่จะ Re: (ก่อนกดส่ง)"):
+        try:
+            with st.spinner("กำลังค้นเมลเดิมใน Gmail..."):
+                imap = imap_connect(st.secrets["EMAIL"], st.secrets["EMAIL_APP_PASSWORD"])
+                for addr, br in keys:
+                    cache[(addr, br)] = find_last_message(imap, addr, branch=br)
+                imap.logout()
+        except Exception as ex:
+            st.warning(f"ค้นเมลเดิมใน Gmail ไม่สำเร็จ ({ex})")
+    checked = (not use_thread) or all(k in cache for k in keys)
+
+    # สรุปปลายทางก่อนส่ง (กันพลาด) พร้อมบอกว่าจะ Re: หัวข้อไหน
+    if mails:
+        rows = []
+        for e, invs, inf in mails:
+            k = (str(e).strip().lower(), inf["branch"])
+            if not use_thread:
+                found, how = (None, None), "เมลใหม่ (ปิดการตอบกลับ)"
+            elif k in cache:
+                found = cache[k] or (None, None)
+                how = None
+            else:
+                found, how = (None, None), "ยังไม่ตรวจ"
+            subj, eff = plan_subject(inf["cust"], inf["branch"], e, found[0], found[1])
+            if how is None:
+                how = "Re: ต่อเมลเดิม" if eff else "เมลใหม่ (ไม่พบเมลเดิม)"
+            rows.append({"ส่งไปที่": e, "ประเภท": "สาขา" if inf["branch"] else "ลูกค้า",
+                         "สาขา": inf["branch"] or "", "จำนวนใบ": len(invs),
+                         "การส่ง": how, "หัวเรื่องที่จะใช้": subj,
+                         "เมลเดิมที่จะ Re:": (found[1] or "") if eff else ""})
+        summary = pd.DataFrame(rows)
+        with st.expander(f"สรุปปลายทางก่อนส่ง ({len(mails)} เมล: "
+                         f"สาขา {int((summary['ประเภท'] == 'สาขา').sum())} / "
+                         f"ลูกค้า {int((summary['ประเภท'] == 'ลูกค้า').sum())})", expanded=True):
+            st.dataframe(summary, hide_index=True)
+        if use_thread and not checked:
+            st.info("กดปุ่ม 'ตรวจหาเมลเดิมที่จะ Re:' ก่อน เพื่อให้ตารางบอกว่าจะต่อหัวข้อเมลไหน แล้วจึงกดส่งได้")
+    confirmed = st.checkbox("ตรวจรายการ ปลายทาง และหัวข้อที่จะ Re: แล้ว พร้อมส่ง", value=False)
+
+    if st.button("เริ่มส่งอีเมล", disabled=not (confirmed and checked)) and len(ready):
         mails = mails[:remaining]
         if not mails:
             st.error("โควต้าวันนี้หมดแล้ว")
             st.stop()
-        # reply_ids: {อีเมลผู้รับ: (Message-ID, หัวเรื่อง) ของเมล TRC Motorsport ล่าสุดที่เคยส่งหาคนนี้}
-        reply_ids, imap_ok = {}, False
         if use_thread:
-            try:
-                with st.spinner("กำลังค้นเมลเดิมใน Gmail..."):
-                    imap = imap_connect(st.secrets["EMAIL"], st.secrets["EMAIL_APP_PASSWORD"])
-                    addrs = sorted({str(e).strip().lower() for e, _, _ in mails})
-                    for addr in addrs:
-                        res0 = find_last_message(imap, addr)
-                        if res0:
-                            reply_ids[addr] = res0
-                    imap.logout()
-                imap_ok = True
-                st.info(f"พบเมลเดิมที่จะตอบกลับ {len(reply_ids)} ราย จาก {len(addrs)} ราย "
-                        "(รายอื่นจะเป็นเมลใหม่ ไม่มี Re:)")
-            except Exception as ex:
-                st.warning(f"ค้นเมลเดิมใน Gmail ไม่สำเร็จ ({ex}) จะส่งเป็นเมลใหม่ "
-                           "(หรือใช้ข้อมูลจากไฟล์ผลการส่งถ้ามี)")
-        if not imap_ok:                              # สำรองจากไฟล์ผลการส่ง (ถ้ามี)
-            reply_ids = {k: (v, None) for k, v in last_message_ids(prev_dfs).items()}
+            reply_ids = {k: v for k, v in cache.items() if v}      # ตามที่แสดงในตารางเท่านั้น
+        else:                                                      # สำรองจากไฟล์ผลการส่ง (ถ้ามี)
+            reply_ids = {(k, None): (v, None) for k, v in last_message_ids(prev_dfs).items()}
         log, bar = [], st.progress(0)
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
             s.login(st.secrets["EMAIL"], st.secrets["EMAIL_APP_PASSWORD"])
             for i, (email, invs, info) in enumerate(mails):
                 try:
-                    k = str(email).strip().lower()
+                    k = (str(email).strip().lower(), info["branch"])
                     rid, psub = reply_ids.get(k, (None, None))
                     m = build_message(st.secrets["EMAIL"],
                                       st.secrets.get("SENDER_NAME", ""),
                                       email, info["cust"], invs, pdfs,
                                       branch=info["branch"],
                                       cust_by_inv=info["cust_by_inv"],
-                                      reply_to_id=rid, prev_subject=psub)
+                                      reply_to_id=rid, prev_subject=psub,
+                                      cc=CC or None)
+                    if info["branch"] and not re.search(
+                            r"\(\s*สาขา\s+" + re.escape(info["branch"]) + r"\b", m["Subject"], re.I):
+                        raise RuntimeError("หัวเรื่องเมลสาขาไม่ถูกต้อง ระบบไม่ส่งเพื่อกันพลาด")
                     s.send_message(m)
                     res = "สำเร็จ"
                     mid = m["Message-ID"]
@@ -171,6 +208,7 @@ if data_file and zip_files:
                     log.append((inv, email, res, t, mid))
                 bar.progress((i + 1) / len(mails))
                 time.sleep(1)
+        st.session_state["reply_cache"] = {}      # ส่งแล้ว ต้องค้นใหม่ครั้งหน้า
         out = pd.DataFrame(log, columns=["invoice_no", "email", "สถานะ", "ส่งเมื่อ", "message_id"])
         st.dataframe(out)
         st.download_button("ดาวน์โหลดผลการส่ง",
