@@ -52,7 +52,8 @@ with st.sidebar:
 # CC ทุกเมล (สาขา + ลูกค้า): ตั้งใน Secrets ที่ CC_EMAIL (หรือ BRANCH_CC ชื่อเดิม)
 CC = str(st.secrets.get("CC_EMAIL", st.secrets.get("BRANCH_CC", ""))).strip()
 N_CC = len([x for x in CC.split(",") if x.strip()])
-MAIL_LIMIT = DAILY_LIMIT // (1 + N_CC)        # Gmail นับตามจำนวนผู้รับ (To + CC)
+# เมลลูกค้ามี CC สาขาเพิ่มอีก 1 ผู้รับ จึงคิดโควต้าแบบกันพลาด: To + CC + สาขา
+MAIL_LIMIT = DAILY_LIMIT // (2 + N_CC)        # Gmail นับตามจำนวนผู้รับ (To + CC)
 
 if data_file and zip_files:
     df = load_sheet(data_file)
@@ -107,6 +108,8 @@ if data_file and zip_files:
             "cust": " / ".join(names),
             "branch": g["branch"].iloc[0] if kind == "สาขา" else None,
             "cust_by_inv": dict(zip(g["invoice_no"], g["customer"].fillna(""))),
+            "inv_branch": dict(zip(g["invoice_no"], g["branch"].fillna(""))),
+            "is_cust": kind == "ลูกค้า",
         }
         for batch in split_batches(list(g["invoice_no"]), pdfs):
             mails.append((email, batch, info))
@@ -119,11 +122,25 @@ if data_file and zip_files:
         st.write(f"ส่งแล้ววันนี้: **{used_today}** / {MAIL_LIMIT} เมล")
         st.write(f"โควต้าเหลือ: **{remaining}**")
         st.write(f"หลังส่งรอบนี้เหลือ: **{max(remaining - len(mails), 0)}**")
-        st.caption(f"Gmail จำกัด {DAILY_LIMIT} ผู้รับ/วัน (นับ To + CC) เมลละ {1 + N_CC} ผู้รับ จึงส่งได้ {MAIL_LIMIT} เมล "
+        st.caption(f"Gmail จำกัด {DAILY_LIMIT} ผู้รับ/วัน (นับ To + CC) เมลลูกค้าละ {2 + N_CC} ผู้รับ (รวม CC สาขา) จึงคิดส่งได้ {MAIL_LIMIT} เมล "
                    "นับจากไฟล์ผลการส่งที่อัปโหลดในช่องที่ 3 เท่านั้น ไม่รวมเมลที่ส่งจากทางอื่นด้วยบัญชีเดียวกัน")
     if len(mails) > remaining:
         st.warning(f"เมลที่ต้องส่ง ({len(mails)}) เกินโควต้าที่เหลือ ({remaining}) "
                    f"ระบบจะส่งแค่ {remaining} เมลแรก ที่เหลือส่งพรุ่งนี้")
+
+    def mail_cc(to, invs, info):
+        """CC กลาง + (เมลลูกค้า) อีเมลสาขาของใบกำกับในเมลนั้น ตัดซ้ำกับผู้รับ"""
+        parts = [x.strip() for x in CC.split(",") if x.strip()]
+        if info.get("is_cust"):
+            for b in sorted({info["inv_branch"].get(i, "") for i in invs}):
+                be = branch_map.get(str(b).strip().upper())
+                if be: parts.append(be)
+        seen, out = {str(to).strip().lower()}, []
+        for p in parts:
+            addr = re.sub(r".*<([^>]+)>.*", r"\1", p).strip().lower()
+            if addr not in seen:
+                seen.add(addr); out.append(p)
+        return ", ".join(out) or None
 
     use_thread = st.checkbox("ตอบกลับเมลเดิมของผู้รับ (ค้นจากโฟลเดอร์ 'ส่งแล้ว' ใน Gmail ไม่ต้องอัปโหลดข้อ 3)",
                              value=True)
@@ -193,7 +210,7 @@ if data_file and zip_files:
                                       branch=info["branch"],
                                       cust_by_inv=info["cust_by_inv"],
                                       reply_to_id=rid, prev_subject=psub,
-                                      cc=CC or None)
+                                      cc=mail_cc(email, invs, info))
                     if info["branch"] and not re.search(
                             r"\(\s*สาขา\s+" + re.escape(info["branch"]) + r"\b", m["Subject"], re.I):
                         raise RuntimeError("หัวเรื่องเมลสาขาไม่ถูกต้อง ระบบไม่ส่งเพื่อกันพลาด")
